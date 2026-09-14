@@ -29,6 +29,40 @@ function mkSparks(scene) {
     geo.attributes.position.needsUpdate=true;geo.attributes.alpha.needsUpdate=true;};
 }
 
+// Each hero has one floor, owned by Villa Sjövik. Use layout CSS pixels before
+// shared entrance/scroll transforms; world Y alone cannot align different canvases.
+const heroFloors = new WeakMap();
+function registerHeroLogo(container, entry) {
+  const hero = container.closest('.h-lockup');
+  if (!hero) return () => {};
+  let group = heroFloors.get(hero);
+  if (!group) {
+    group = { entries: [], frame: 0 };
+    group.schedule = () => {
+      if (group.frame) return;
+      group.frame = requestAnimationFrame(() => {
+        group.frame = 0;
+        const reference = group.entries.find(e => e.container.matches('.hero-logo-vs'));
+        if (!reference?.ready()) return;
+        reference.fit();
+        const limit = reference.projectedSize();
+        const floor = reference.floorY();
+        for (const logo of group.entries) {
+          if (logo === reference || !logo.ready()) continue;
+          logo.fit(limit);
+          logo.alignFloor(floor);
+        }
+      });
+    };
+    heroFloors.set(hero, group);
+    // Reproject after entrance transforms and responsive layout changes as well.
+    hero.addEventListener('transitionend', group.schedule);
+    window.addEventListener('resize', group.schedule, { passive: true });
+  }
+  group.entries.push({ container, ...entry });
+  return group.schedule;
+}
+
 /* ── MAIN ────────────────────────────────────── */
 function initLogo3D(container) {
   const svgPath = container.dataset.svg;
@@ -41,7 +75,8 @@ function initLogo3D(container) {
   const rotDelay = parseFloat(container.dataset.delay || '0');
   const nudgeX = parseFloat(container.dataset.nudgeX || '0');
   const yOffset = parseFloat(container.dataset.yOffset || '0');
-  const shadowYAbs = container.dataset.shadowY; // absolute Y for shadow (overrides auto)
+  // Legacy overrides remain available outside grouped heroes only.
+  const shadowYAbs = container.closest('.h-lockup') ? null : container.dataset.shadowY;
   const mode = container.dataset.mode || 'spin';
   const isTilt = mode === 'tilt';
   const motion = container.dataset.motion || 'default'; // 'default' | 'float-spin'
@@ -140,6 +175,7 @@ function initLogo3D(container) {
 
   const updSparks = hasSparks ? mkSparks(scene) : null;
   let logoBox = null;
+  let fittedSize = null;
   let refitLogo = null; // set in load-callback; re-called on container resize so the fit follows vw-based containers
   let rotAngle = 0;
   let elapsed = 0;
@@ -173,6 +209,32 @@ function initLogo3D(container) {
     // No rotation — keep it facing the camera
     scene.add(shadowPlane);
   }
+
+  const viewHeight = () => 2 * Math.tan(camera.fov * Math.PI / 360) * camera.position.z;
+  const hero = container.closest('.h-lockup');
+  const layoutTop = () => {
+    let top = 0;
+    for (let el = container; el && el !== hero; el = el.offsetParent) top += el.offsetTop;
+    return top;
+  };
+  const scheduleHeroFit = registerHeroLogo(container, {
+    ready: () => !!refitLogo && !!logoBox,
+    fit: limit => refitLogo(limit),
+    projectedSize: () => {
+      const px = container.clientHeight / viewHeight();
+      return { w: fittedSize.x * px, h: fittedSize.y * px,
+        spin: Math.hypot(fittedSize.x, fittedSize.z) * px };
+    },
+    floorY: () => {
+      const y = shadowPlane?.position.y ?? (-logoBox.h / 2 - 50 + yOffset);
+      return layoutTop() + (0.5 - y / viewHeight()) * container.clientHeight;
+    },
+    alignFloor: floor => {
+      if (!shadowPlane) return;
+      const height = container.clientHeight;
+      if (height) shadowPlane.position.y = (0.5 - (floor - layoutTop()) / height) * viewHeight();
+    }
+  });
 
   const useColorFromSvg = container.dataset.useSvgColor === 'true';
 
@@ -225,7 +287,7 @@ function initLogo3D(container) {
     // från ResizeObservern. Innan låg den bara i load-callbacken — s beräknades EN gång från
     // containerns init-mått, så när en vw-baserad container krympte (fönster-resize, rotation,
     // devtools) behöll loggan sin world-storlek och klipptes av canvas-kanten ("Maxifl…").
-    refitLogo = () => {
+    refitLogo = (limit = null) => {
       const vFOV = camera.fov * Math.PI / 180;
       const visH = 2 * Math.tan(vFOV / 2) * camera.position.z;
       const visW = visH * camera.aspect;
@@ -238,22 +300,22 @@ function initLogo3D(container) {
       // aldrig kan nå canvas-kanten
       const fillW = aspect > 4 ? 0.48 : aspect > 2 ? 0.52 : 0.65;
       const fillH = 0.70;
-      const s = Math.min((visW * fillW) / diagW, (visH * fillH) / rawSize.y);
+      let s = Math.min((visW * fillW) / diagW, (visH * fillH) / rawSize.y);
+      if (limit) {
+        const px = container.clientHeight / visH;
+        if (px > 0) s = Math.min(s, limit.w / (rawSize.x * px),
+          limit.h / (rawSize.y * px), limit.spin / (Math.hypot(rawSize.x, rawSize.z) * px));
+      }
 
-      logo.position.set(0, 0, 0); // idempotens: nollställ innan drift-korrektion
+      logo.position.set(0, 0, 0); // geometry was centered before joining the animated pivot
       logo.scale.set(s, -s, s); // -s flips Y for SVG coords
 
-      // Verify center is still at origin after scale
-      const finalBox = new THREE.Box3().setFromObject(logo);
-      const drift = finalBox.getCenter(new THREE.Vector3());
-      logo.position.sub(drift);
-
-      const fSize = finalBox.getSize(new THREE.Vector3());
+      const fSize = rawSize.clone().multiplyScalar(s);
+      fittedSize = fSize;
       logoBox = { w: fSize.x, h: fSize.y };
 
-      // Position shadow plane
-      // If data-shadow-y is set, use absolute Y (aligns shadows across multiple logos)
-      // Otherwise auto: far below logo bottom so logo doesn't sit in its own shadow
+      // Villa Sjövik defines the hero floor from its own fitted silhouette.
+      // The coordinator projects that floor into each customer's camera.
       if (shadowPlane) {
         shadowPlane.position.y = shadowYAbs != null
           ? parseFloat(shadowYAbs)
@@ -270,6 +332,7 @@ function initLogo3D(container) {
     }
 
     pivot.add(logo);
+    scheduleHeroFit();
   },
   undefined, // onProgress
   (err) => {
@@ -383,7 +446,8 @@ function initLogo3D(container) {
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
     renderer.setSize(w, h);
-    if (refitLogo) refitLogo(); // skala om loggan till den nya vyn — annars klipps den vid krympt container
+    if (refitLogo) refitLogo();
+    scheduleHeroFit(); // refit reference first, then cap and align its siblings
   }).observe(container);
 }
 
